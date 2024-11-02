@@ -1,5 +1,8 @@
 use clap::{Parser, Subcommand};
 use flate2::write::ZlibDecoder;
+use flate2::write::ZlibEncoder;
+use flate2::Compression;
+use sha1::{Digest, Sha1};
 #[allow(unused_imports)]
 use std::env;
 #[allow(unused_imports)]
@@ -90,6 +93,32 @@ impl GitRepo {
         writer = decoder.finish()?;
         Ok(String::from_utf8(writer)?)
     }
+
+    fn compress_content(&self, content: String) -> Result<Vec<u8>> {
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(content.as_bytes())?;
+        let comprssed_bytes = encoder.finish()?;
+        Ok(comprssed_bytes)
+    }
+
+    fn hash_object(&self, filename: &str) -> Result<String> {
+        let file_content = fs::read_to_string(filename)?;
+        let content_to_hash = format!("blob {}\0{}", file_content.len(), file_content);
+        let mut hasher = Sha1::new();
+        hasher.update(content_to_hash.as_bytes());
+        let result = hasher.finalize();
+        Ok(format!("{:x}", result))
+    }
+
+    fn write_object(&self, hash: &str, filename: &str) -> Result<()> {
+        let file_content = fs::read_to_string(filename)?;
+        let zlib_content_to_compress = format!("blob {}\0{}", file_content.len(), file_content);
+        let compressed = self.compress_content(zlib_content_to_compress)?;
+        let (dir, file) = hash.split_at(2);
+        fs::create_dir(self.path.join("objects").join(dir))?;
+        fs::write(self.path.join("objects").join(dir).join(file), compressed)?;
+        Ok(())
+    }
 }
 
 #[derive(Parser)]
@@ -118,7 +147,15 @@ enum Commands {
         /// The object hash
         object_hash: String,
     },
+    #[command(name = "hash-object")]
+    HashObject {
+        #[arg(short = 'w', group = "mode")]
+        write: bool,
+
+        filename: String,
+    },
 }
+
 fn run_command(command: &Commands) -> Result<()> {
     let repo = GitRepo::new();
     match command {
@@ -146,6 +183,18 @@ fn run_command(command: &Commands) -> Result<()> {
                 }
                 (_, _, _, true) => Ok(()),
                 _ => Err(GitError::Parse("No mode specified".into())),
+            }
+        }
+        Commands::HashObject { write, filename } => {
+            if *write {
+                let hash = repo.hash_object(filename)?;
+                print!("{}", hash);
+                repo.write_object(&hash, &filename)?;
+                Ok(())
+            } else {
+                let hash = repo.hash_object(filename)?;
+                print!("{}", hash);
+                Ok(())
             }
         }
     }
