@@ -1,14 +1,96 @@
 use clap::{Parser, Subcommand};
-use flate2::bufread::GzDecoder;
 use flate2::write::ZlibDecoder;
 #[allow(unused_imports)]
 use std::env;
 #[allow(unused_imports)]
 use std::fs;
-use std::fs::File;
 use std::io;
 use std::io::prelude::*;
 use std::path::PathBuf;
+use thiserror::Error;
+
+#[derive(Error, Debug)]
+pub enum GitError {
+    #[error("IO error: {0}")]
+    Io(#[from] io::Error),
+
+    #[error("UTF-8 conversion error: {0}")]
+    Utf8(#[from] std::string::FromUtf8Error),
+
+    #[error("Object parsing error: {0}")]
+    Parse(String),
+
+    #[error("Invalid object hash: {0}")]
+    InvalidHash(String),
+}
+
+type Result<T> = std::result::Result<T, GitError>;
+
+#[derive(Debug)]
+struct GitObject {
+    type_: String,
+    content: String,
+    size: usize,
+}
+
+impl GitObject {
+    fn from_raw(content: String) -> Result<Self> {
+        let (header, content) = content
+            .split_once('\0')
+            .ok_or_else(|| GitError::Parse("Missing null byte separator".into()))?;
+        let parts: Vec<&str> = header.split_whitespace().collect();
+        if parts.len() != 2 {
+            return Err(GitError::Parse("Invalid header format".into()));
+        }
+        Ok(GitObject {
+            type_: parts[0].to_string(),
+            size: parts[1]
+                .parse()
+                .map_err(|_| GitError::Parse("Invalid Size".into()))?,
+            content: content.to_string(),
+        })
+    }
+}
+
+struct GitRepo {
+    path: PathBuf,
+}
+
+impl GitRepo {
+    fn new() -> Self {
+        GitRepo {
+            path: PathBuf::from(".git"),
+        }
+    }
+
+    fn init(&self) -> Result<()> {
+        fs::create_dir(".git").unwrap();
+        fs::create_dir(".git/objects").unwrap();
+        fs::create_dir(".git/refs").unwrap();
+        fs::write(".git/HEAD", "ref: refs/heads/main\n").unwrap();
+        println!("Initialized git directory");
+        Ok(())
+    }
+
+    fn read_object(&self, hash: &str) -> Result<GitObject> {
+        if hash.len() < 2 {
+            return Err(GitError::InvalidHash("Hash too short".into()));
+        }
+        let (dir, file) = hash.split_at(2);
+        let object_path = self.path.join("objects").join(dir).join(file);
+        let compressed_data = fs::read(&object_path)?;
+        let decompressed = self.decompress_object(&compressed_data)?;
+        GitObject::from_raw(decompressed)
+    }
+
+    fn decompress_object(&self, data: &[u8]) -> Result<String> {
+        let mut writer = Vec::new();
+        let mut decoder = ZlibDecoder::new(writer);
+        decoder.write_all(data)?;
+        writer = decoder.finish()?;
+        Ok(String::from_utf8(writer)?)
+    }
+}
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -37,72 +119,10 @@ enum Commands {
         object_hash: String,
     },
 }
-
-fn parse_blob(content: String) -> Option<(String, String)> {
-    let null_pos = content.find('\0')?;
-    let (header, content) = content.split_at(null_pos);
-    let content = &content[1..];
-    Some((header.to_string(), content.to_string()))
-}
-fn read_compressed_file(path: &str) -> Result<String, Box<dyn std::error::Error>> {
-    // Open the file
-    let file = fs::read(path).unwrap();
-    let mut writer = Vec::new();
-
-    let mut decoder = ZlibDecoder::new(writer);
-    decoder.write_all(&file).unwrap();
-    writer = decoder.finish().unwrap();
-    let content = String::from_utf8(writer).expect("Error parsing to string, line 57");
-    Ok(content)
-}
-
-fn read_file(object_hash: String) -> Result<String, Box<dyn std::error::Error>> {
-    let (dir, hash) = object_hash.split_at(2);
-    let mut path = PathBuf::new();
-    path.push("./.git/objects/");
-    path.push(dir);
-    path.push(hash);
-    let res = read_compressed_file(path.to_str().unwrap());
-    if let Ok(content) = res {
-        Ok(content)
-    } else {
-        Err(res.unwrap_err())
-    }
-}
-
-fn pretty_print(object_hash: String) -> Result<String, Box<dyn std::error::Error>> {
-    let content = read_file(object_hash)?;
-    let parse_res = parse_blob(content);
-    if let Some((_header, content)) = parse_res {
-        Ok(content)
-    } else {
-        Ok(String::from("something"))
-    }
-}
-
-fn object_type(_object_hash: String) -> io::Result<()> {
-    unimplemented!()
-}
-
-fn object_exists(_object_hash: String) -> io::Result<()> {
-    unimplemented!()
-}
-
-fn object_size(_object_hash: String) -> io::Result<()> {
-    unimplemented!();
-}
-
-fn main() {
-    let cli = Cli::parse();
-
-    match &cli.command {
-        Commands::Init => {
-            fs::create_dir(".git").unwrap();
-            fs::create_dir(".git/objects").unwrap();
-            fs::create_dir(".git/refs").unwrap();
-            fs::write(".git/HEAD", "ref: refs/heads/main\n").unwrap();
-            println!("Initialized git directory")
-        }
+fn run_command(command: &Commands) -> Result<()> {
+    let repo = GitRepo::new();
+    match command {
+        Commands::Init => repo.init(),
         Commands::CatFile {
             pretty,
             type_,
@@ -110,16 +130,31 @@ fn main() {
             exists,
             object_hash,
         } => {
-            if *pretty {
-                let content = pretty_print(object_hash.to_string()).unwrap();
-                print!("{}", content);
-            } else if *type_ {
-                let _ = object_type(object_hash.to_string());
-            } else if *size {
-                let _ = object_size(object_hash.to_string());
-            } else if *exists {
-                let _ = object_exists(object_hash.to_string());
+            let object = repo.read_object(&object_hash)?;
+            match (pretty, type_, size, exists) {
+                (true, _, _, _) => {
+                    print!("{}", object.content);
+                    Ok(())
+                }
+                (_, true, _, _) => {
+                    println!("{}", object.type_);
+                    Ok(())
+                }
+                (_, _, true, _) => {
+                    println!("{}", object.size);
+                    Ok(())
+                }
+                (_, _, _, true) => Ok(()),
+                _ => Err(GitError::Parse("No mode specified".into())),
             }
         }
+    }
+}
+
+fn main() {
+    let cli = Cli::parse();
+    if let Err(err) = run_command(&cli.command) {
+        eprintln!("Error: {}", err);
+        std::process::exit(1);
     }
 }
