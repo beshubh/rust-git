@@ -9,6 +9,7 @@ use sha1::{Digest, Sha1};
 use std::env;
 #[allow(unused_imports)]
 use std::fs;
+use std::fs::hard_link;
 use std::io;
 use std::io::prelude::*;
 use std::path::PathBuf;
@@ -65,6 +66,21 @@ fn read_tree_object(data: &Vec<u8>) -> Result<String> {
         entries.push(name.to_string());
     }
     Ok(entries.join("\n"))
+}
+
+fn write_tree_object() -> Result<String> {
+    let entries = fs::read_dir(".")?;
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            // TODO: compte tree sha
+        } else if path.is_file() {
+            // TODO: compute blob sha, write the blob object
+        }
+    }
+
+    Ok("something".into())
 }
 
 impl GitObject {
@@ -139,26 +155,26 @@ impl GitRepo {
         Ok(writer)
     }
 
-    fn compress_content(&self, content: String) -> Result<Vec<u8>> {
+    fn compress_content(&self, byte_sequence: &Vec<u8>) -> Result<Vec<u8>> {
         let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
-        encoder.write_all(content.as_bytes())?;
+        encoder.write_all(byte_sequence)?;
         let comprssed_bytes = encoder.finish()?;
         Ok(comprssed_bytes)
     }
 
-    fn hash_object(&self, filename: &str) -> Result<String> {
-        let file_content = fs::read_to_string(filename)?;
-        let content_to_hash = format!("blob {}\0{}", file_content.len(), file_content);
+    fn hash_object(&self, object_byte_sequence: &Vec<u8>, object_type: String) -> Result<String> {
         let mut hasher = Sha1::new();
-        hasher.update(content_to_hash.as_bytes());
+        hasher.update(object_type.as_bytes());
+        hasher.update(b" ");
+        hasher.update(object_byte_sequence.len().to_string().as_bytes());
+        hasher.update(b"\0");
+        hasher.update(object_byte_sequence);
         let result = hasher.finalize();
         Ok(format!("{:x}", result))
     }
 
-    fn write_object(&self, hash: &str, filename: &str) -> Result<()> {
-        let file_content = fs::read_to_string(filename)?;
-        let zlib_content_to_compress = format!("blob {}\0{}", file_content.len(), file_content);
-        let compressed = self.compress_content(zlib_content_to_compress)?;
+    fn write_object(&self, hash: &str, byte_sequence: &Vec<u8>) -> Result<()> {
+        let compressed = self.compress_content(byte_sequence)?;
         let (dir, file) = hash.split_at(2);
         fs::create_dir(self.path.join("objects").join(dir))?;
         fs::write(self.path.join("objects").join(dir).join(file), compressed)?;
@@ -172,6 +188,71 @@ impl GitRepo {
         }
         let output = git_object.content;
         Ok(output)
+    }
+
+    fn write_tree(&self, dir_path: Option<&str>) -> Result<String> {
+        let mut p = ".";
+        if dir_path.is_some() {
+            p = dir_path.unwrap();
+        }
+
+        let mut tree_entries = Vec::new();
+
+        let dir_entries = fs::read_dir(p)?;
+        for dir_entry in dir_entries {
+            let dir_entry = dir_entry?;
+            let path = dir_entry.path();
+            let filename = path
+                .file_name()
+                .ok_or_else(|| GitError::Parse("invalid filename".into()))?
+                .to_string_lossy()
+                .into_owned();
+            if filename == String::from(".git") {
+                continue;
+            }
+            if path.is_dir() {
+                let hash = self.write_tree(Option::Some(path.to_str().unwrap()))?;
+                tree_entries.push(["40000".to_string(), filename, "\0".to_string(), hash]);
+            } else if path.is_file() {
+                let object_byte_sequence = fs::read(path)?;
+                let hash = self.hash_object(&object_byte_sequence, "blob".into())?;
+                let byte_sequence_with_header = [
+                    b"blob ",
+                    object_byte_sequence.len().to_string().as_bytes(),
+                    b"\0",
+                    &object_byte_sequence,
+                ]
+                .concat();
+                self.write_object(&hash, &byte_sequence_with_header)?;
+                tree_entries.push(["100644".to_string(), filename, "\0".to_string(), hash]);
+            }
+        }
+        tree_entries.sort_by(|a, b| a[1].cmp(&b[1]));
+        let tree_entries_bytes = tree_entries
+            .iter()
+            .map(|entry| {
+                [
+                    entry[0].as_bytes(),
+                    b" ",
+                    entry[1].as_bytes(),
+                    entry[2].as_bytes(),
+                    &hex::decode(entry[3].clone()).unwrap(),
+                ]
+                .concat()
+            })
+            .collect::<Vec<_>>()
+            .concat();
+
+        let hash = self.hash_object(&tree_entries_bytes, "tree".into())?;
+        let tree_byte_sequence = [
+            b"tree ",
+            tree_entries_bytes.len().to_string().as_bytes(),
+            b"\0",
+            &tree_entries_bytes,
+        ]
+        .concat();
+        self.write_object(&hash, &tree_byte_sequence)?;
+        Ok(hash)
     }
 }
 
@@ -214,6 +295,8 @@ enum Commands {
         name_only: bool,
         tree_ish: String,
     },
+    #[command(name = "write-tree")]
+    WriteTree,
 }
 
 fn run_command(command: &Commands) -> Result<()> {
@@ -247,12 +330,20 @@ fn run_command(command: &Commands) -> Result<()> {
         }
         Commands::HashObject { write, filename } => {
             if *write {
-                let hash = repo.hash_object(filename)?;
+                let hash = repo.hash_object(&fs::read(filename)?, "blob".into())?;
+                let file_content = fs::read(filename)?;
+                let byte_sequence: Vec<u8> = [
+                    b"blob ",
+                    file_content.len().to_string().as_bytes(),
+                    b"\0",
+                    &file_content,
+                ]
+                .concat();
+                repo.write_object(&hash, &byte_sequence)?;
                 print!("{}", hash);
-                repo.write_object(&hash, &filename)?;
                 Ok(())
             } else {
-                let hash = repo.hash_object(filename)?;
+                let hash = repo.hash_object(&fs::read(filename)?, "blob".into())?;
                 print!("{}", hash);
                 Ok(())
             }
@@ -260,6 +351,11 @@ fn run_command(command: &Commands) -> Result<()> {
         Commands::LsTree { tree_ish, .. } => {
             let output = repo.ls_tree(&tree_ish)?;
             println!("{}", output);
+            Ok(())
+        }
+        Commands::WriteTree => {
+            let output = repo.write_tree(None)?;
+            print!("{}", output);
             Ok(())
         }
     }
