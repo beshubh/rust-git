@@ -12,7 +12,6 @@ use std::fs;
 use std::io;
 use std::io::prelude::*;
 use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -241,29 +240,18 @@ impl GitRepo {
     }
 
     fn commit_tree(&self, tree_sha: &str, parent: &str, message: &str) -> Result<String> {
-        eprintln!(
-            "tree sha: {}, parent: {}, message: {}",
-            tree_sha, parent, message
-        );
-        let tree_sha_bytes = hex::decode(tree_sha).unwrap();
-        let parent_sha_bytes = hex::decode(parent).unwrap();
         let content_bytes = [
             b"tree ",
             tree_sha.to_string().as_bytes(),
-            b" ",
+            b"\n",
+            b"parent ",
             parent.to_string().as_bytes(),
-            "author shubh <shubh@gmail.com>".to_string().as_bytes(),
-            b" ",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_secs()
-                .to_string()
-                .as_bytes(),
-            b" ",
-            b"Asia/Kolkata",
-            b" ",
+            b"\n",
+            b"author shubh <shubh@gmail.com> 1709990458 +0100\n",
+            b"committer shubh <shubh@gmail.com> 1709990458 +0100\n",
+            b"\n",
             message.to_string().as_bytes(),
+            b"\n",
         ]
         .concat();
 
