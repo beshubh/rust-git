@@ -1,7 +1,9 @@
+use anyhow;
 use clap::{Parser, Subcommand};
 use flate2::write::ZlibDecoder;
 use flate2::write::ZlibEncoder;
 use flate2::Compression;
+use hex;
 use sha1::{Digest, Sha1};
 #[allow(unused_imports)]
 use std::env;
@@ -17,6 +19,9 @@ pub enum GitError {
     #[error("IO error: {0}")]
     Io(#[from] io::Error),
 
+    #[error("fatal: invalid object type: {0}")]
+    OType(String),
+
     #[error("UTF-8 conversion error: {0}")]
     Utf8(#[from] std::string::FromUtf8Error),
 
@@ -27,7 +32,7 @@ pub enum GitError {
     InvalidHash(String),
 }
 
-type Result<T> = std::result::Result<T, GitError>;
+type Result<T> = anyhow::Result<T, GitError>;
 
 #[derive(Debug)]
 struct GitObject {
@@ -36,22 +41,62 @@ struct GitObject {
     size: usize,
 }
 
+fn read_tree_object(data: &Vec<u8>) -> Result<String> {
+    // NOTE: we don't completely implement's git's ls-tree we are just showing the name
+    // but with our implementaion it's not that hard to implement full ls-tree
+    let mut entries = Vec::new();
+    let mut position = 0;
+    while position < data.len() {
+        let null_pos = data[position..]
+            .iter()
+            .position(|&b| b == 0)
+            .ok_or(GitError::Parse("Invalid object format".into()))?;
+        let mode_and_name = String::from_utf8(data[position..position + null_pos].to_vec())?;
+        let (_mode, name) = mode_and_name
+            .split_once(' ')
+            .ok_or(GitError::Parse("Invalid ojbectf format".into()))?;
+        position += null_pos + 1;
+
+        if position + 20 > data.len() {
+            return Err(GitError::Parse("Incomplete SHA".into()));
+        }
+        let _sha = hex::encode(&data[position..position + 20]);
+        position += 20;
+        entries.push(name.to_string());
+    }
+    Ok(entries.join("\n"))
+}
+
 impl GitObject {
-    fn from_raw(content: String) -> Result<Self> {
-        let (header, content) = content
-            .split_once('\0')
-            .ok_or_else(|| GitError::Parse("Missing null byte separator".into()))?;
+    fn from_raw(raw_bytes: Vec<u8>) -> Result<Self> {
+        let null_pos = raw_bytes
+            .iter()
+            .position(|&b| b == 0)
+            .ok_or(GitError::Parse("Invalid object format".into()))?;
+        let header = String::from_utf8(raw_bytes[..null_pos].to_vec())?;
         let parts: Vec<&str> = header.split_whitespace().collect();
         if parts.len() != 2 {
             return Err(GitError::Parse("Invalid header format".into()));
         }
-        Ok(GitObject {
-            type_: parts[0].to_string(),
-            size: parts[1]
-                .parse()
-                .map_err(|_| GitError::Parse("Invalid Size".into()))?,
-            content: content.to_string(),
-        })
+        let content = raw_bytes[null_pos + 1..].to_vec();
+        let type_ = parts[0].to_string();
+        let size = parts[1]
+            .parse()
+            .map_err(|_| GitError::Parse("Invalid Size".into()))?;
+
+        match type_.as_str() {
+            "blob" => Ok(GitObject {
+                type_,
+                size,
+                content: String::from_utf8(content.into())?,
+            }),
+            "tree" => Ok(GitObject {
+                type_,
+                size,
+                content: read_tree_object(&content.into())?,
+            }),
+            default => Err(GitError::OType(default.into())),
+        }
     }
 }
 
@@ -83,15 +128,15 @@ impl GitRepo {
         let object_path = self.path.join("objects").join(dir).join(file);
         let compressed_data = fs::read(&object_path)?;
         let decompressed = self.decompress_object(&compressed_data)?;
-        GitObject::from_raw(decompressed)
+        Ok(GitObject::from_raw(decompressed)?)
     }
 
-    fn decompress_object(&self, data: &[u8]) -> Result<String> {
+    fn decompress_object(&self, data: &[u8]) -> Result<Vec<u8>> {
         let mut writer = Vec::new();
         let mut decoder = ZlibDecoder::new(writer);
         decoder.write_all(data)?;
         writer = decoder.finish()?;
-        Ok(String::from_utf8(writer)?)
+        Ok(writer)
     }
 
     fn compress_content(&self, content: String) -> Result<Vec<u8>> {
@@ -118,6 +163,15 @@ impl GitRepo {
         fs::create_dir(self.path.join("objects").join(dir))?;
         fs::write(self.path.join("objects").join(dir).join(file), compressed)?;
         Ok(())
+    }
+
+    fn ls_tree(&self, tree_ish: &str) -> Result<String> {
+        let git_object = self.read_object(tree_ish)?;
+        if git_object.type_ != String::from("tree") {
+            return Err(GitError::OType(git_object.type_));
+        }
+        let output = git_object.content;
+        Ok(output)
     }
 }
 
@@ -153,6 +207,12 @@ enum Commands {
         write: bool,
 
         filename: String,
+    },
+    #[command(name = "ls-tree")]
+    LsTree {
+        #[arg(long)]
+        name_only: bool,
+        tree_ish: String,
     },
 }
 
@@ -197,13 +257,18 @@ fn run_command(command: &Commands) -> Result<()> {
                 Ok(())
             }
         }
+        Commands::LsTree { tree_ish, .. } => {
+            let output = repo.ls_tree(&tree_ish)?;
+            println!("{}", output);
+            Ok(())
+        }
     }
 }
 
 fn main() {
     let cli = Cli::parse();
-    if let Err(err) = run_command(&cli.command) {
-        eprintln!("Error: {}", err);
-        std::process::exit(1);
-    }
+    // if let Err(err) = run_command(&cli.command) {
+    //     eprintln!("{}", err);
+    // }
+    run_command(&cli.command).unwrap();
 }
