@@ -9,7 +9,6 @@ use sha1::{Digest, Sha1};
 use std::env;
 #[allow(unused_imports)]
 use std::fs;
-use std::fs::hard_link;
 use std::io;
 use std::io::prelude::*;
 use std::path::PathBuf;
@@ -66,21 +65,6 @@ fn read_tree_object(data: &Vec<u8>) -> Result<String> {
         entries.push(name.to_string());
     }
     Ok(entries.join("\n"))
-}
-
-fn write_tree_object() -> Result<String> {
-    let entries = fs::read_dir(".")?;
-    for entry in entries {
-        let entry = entry?;
-        let path = entry.path();
-        if path.is_dir() {
-            // TODO: compte tree sha
-        } else if path.is_file() {
-            // TODO: compute blob sha, write the blob object
-        }
-    }
-
-    Ok("something".into())
 }
 
 impl GitObject {
